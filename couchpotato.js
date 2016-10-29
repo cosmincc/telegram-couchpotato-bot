@@ -1,7 +1,6 @@
 'use strict';
 
 var fs             = require('fs');                        // https://nodejs.org/api/fs.html
-var moment         = require('moment');                    // https://www.npmjs.com/package/moment
 var _              = require('lodash');                    // https://www.npmjs.com/package/lodash
 var NodeCache      = require('node-cache');                // https://www.npmjs.com/package/node-cache
 var CouchPotatoAPI = require('couchpotato-api');           // https://www.npmjs.com/package/couchpotato-api
@@ -48,51 +47,83 @@ bot.getMe()
 handle start command
  */
 bot.onText(/\/start/, function(msg) {
-  var fromId = msg.from.id;
-  var username = msg.from.username || msg.from.first_name;
+  var chatId = msg.chat.id;
+  verifyUser(msg.from.id, chatId);
 
-  verifyUser(fromId);
+  var response = ['Hello @' + getTelegramName(msg.from) + '!'];
+  response.push('\n`/help` to continue...');
 
-  var response = ['Hello ' + username + '!'];
-  response.push('\n`/q [movie name]` to continue...');
-
-  bot.sendMessage(fromId, response.join('\n'), {
-    'parse_mode': 'Markdown',
-    'selective': 2,
-  });
+  sendMessage(chatId, response.join('\n'));
 });
 
 /*
  * handle help command
  */
 bot.onText(/\/help/, function(msg) {
-  var fromId = msg.from.id;
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
 
-  verifyUser(fromId);
+  verifyUser(userId, chatId);
 
-  logger.info('user: %s, message: sent \'/help\' command', fromId);
-  sendCommands(fromId);
+  logger.info('user: %s, message: sent `/help` command', userId);
+  var response = ['Below is a list of commands you(@' + getTelegramName(msg.from) + ') have access to:'];
+  response.push('\n*General commands:*');
+  response.push('`/start` to start this bot');
+  response.push('`/help` to for this list of commands');
+  response.push('`/q [movie name]` search for a movie');
+  response.push('`/library [movie name]` search library');
+  response.push('`/clear` clear all previous commands');
+
+  if (isAdmin(userId)) {
+    response.push('\n*Admin commands:*');
+    response.push('`/wanted` search all missing/wanted movies');
+    response.push('`/users` list users');
+    response.push('`/revoke` revoke user from bot');
+    response.push('`/unrevoke` un-revoke user from bot');
+  }
+
+  sendMessage(chatId, response.join('\n'));
 });
 
 /*
 handle query command
  */
-bot.onText(/\/[Qq](uery)? (.+)/, function(msg, match) {
-  var fromId = msg.from.id;
+bot.onText(/\/[Qq](uery)?\s?(.+)?/, function(msg, match) {
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
   var movieName = match[2];
 
-  verifyUser(fromId);
+  verifyUser(userId, chatId);
+
+  if (movieName) {
+    handleMovieSearch(msg, movieName);
+  } else {
+    logger.info('user: %s message: entered movie query mode (state: %s)', userId, state.couchpotato.MOVIE_SEARCH);
+    cache.set('state' + userId, state.couchpotato.MOVIE_SEARCH);
+    sendMessage(chatId, i18n.__('moviesLookup'), {
+      reply_to_message_id: msg.message_id,
+      reply_markup: {
+        force_reply: true,
+        selective: true
+      }
+    });
+  }
+ });
+
+function handleMovieSearch(msg, movieName) {
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
 
   couchpotato.get('movie.search', { 'q': movieName })
     .then(function(result) {
       if (!result.movies) {
+        cache.set('state' + userId, state.couchpotato.MOVIE_SEARCH);
         throw new Error('Could not find ' + movieName + ', try searching again');
       }
-
       return result.movies;
     })
     .then(function(movies) {
-      logger.info('user: %s, message: requested to search for series "%s"', fromId, movieName);
+      logger.info('user: %s, message: requested to search for movie "%s"', userId, movieName);
 
       var movieList = [];
       var message = ['*Found ' + movies.length + ' movies:*'];
@@ -111,14 +142,14 @@ bot.onText(/\/[Qq](uery)? (.+)/, function(msg, match) {
         var keyboardValue = title + (year ? ' - ' + year : '');
 
         movieList.push({
-          'id': id,
-          'title': title,
-          'year': year,
-          'rating': rating,
-          'movie_id': movieId,
-          'thumb': thumb,
-          'via_imdb': onIMDb,
-          'keyboard_value': keyboardValue
+          id: id,
+          title: title,
+          year: year,
+          rating: rating,
+          movie_id: movieId,
+          thumb: thumb,
+          via_imdb: onIMDb,
+          keyboard_value: keyboardValue
         });
 
         message.push(
@@ -135,8 +166,8 @@ bot.onText(/\/[Qq](uery)? (.+)/, function(msg, match) {
       message.push('\nPlease select from the menu below.');
 
       // set cache
-      cache.set('movieList' + fromId, movieList);
-      cache.set('state' + fromId, state.couchpotato.MOVIE);
+      cache.set('movieList' + userId, movieList);
+      cache.set('state' + userId, state.couchpotato.MOVIE);
 
       return {
         message: message.join('\n'),
@@ -144,62 +175,71 @@ bot.onText(/\/[Qq](uery)? (.+)/, function(msg, match) {
       };
     })
     .then(function(response) {
-      bot.sendMessage(fromId, response.message, {
-        'disable_web_page_preview': true,
-        'parse_mode': 'Markdown',
-        'selective': 2,
-        'reply_markup': JSON.stringify({ keyboard: response.keyboard, one_time_keyboard: true })
+      sendMessage(chatId, response.message, {
+        reply_to_message_id: msg.message_id,
+        reply_markup: {
+          keyboard: response.keyboard,
+          one_time_keyboard: true,
+          force_reply: true,
+          selective: true
+        }
       });
     })
     .catch(function(err) {
-      replyWithError(fromId, err);
+      replyWithError(userId, err, chatId);
     });
 
-});
+};
 
 /*
  Captures any and all messages, filters out commands, handles profiles and movies
  sent via the custom keyboard.
  */
 bot.on('message', function(msg) {
-  var fromId = msg.from.id;
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
   var message = msg.text;
 
-  verifyUser(fromId);
+  verifyUser(userId, chatId);
 
   // If the message is a command, ignore it.
   if(msg.text[0] != '/') {
     // Check cache to determine state, if cache empty prompt user to start a movie search
-    var currentState = cache.get('state' + fromId);
+    var currentState = cache.get('state' + userId);
     if (!currentState) {
-      return replyWithError(fromId, new Error('Try searching for a movie first with `/q movie name`'));
+      return replyWithError(userId, new Error(i18n.__('noState')), chatId);
     } else {
       switch(currentState) {
+        case state.couchpotato.MOVIE_SEARCH:
+          verifyUser(userId, chatId);
+          logger.info('user: %s, message: entered the movie name: %s', userId, message);
+          handleMovieSearch(msg, message);
+          break;
         case state.couchpotato.MOVIE:
-          logger.info('user: %s, message: choose the movie %s', fromId, message);
-          handleMovie(fromId, message);
+          logger.info('user: %s, message: choose the movie %s', userId, message);
+          handleMovie(msg);
           break;
         case state.couchpotato.PROFILE:
-          logger.info('user: %s, message: choose the profile "%s"', fromId, message);
-          handleProfile(fromId, message);
+          logger.info('user: %s, message: choose the profile "%s"', userId, message);
+          handleProfile(chatId, userId, message);
           break;
         case state.admin.REVOKE_CONFIRM:
-          verifyAdmin(fromId);
-          logger.info('user: %s, message: choose the revoke confirmation "%s"', fromId, message);
-          handleRevokeUserConfirm(fromId, message);
+          verifyAdmin(userId, chatId);
+          logger.info('user: %s, message: choose the revoke confirmation "%s"', userId, message);
+          handleRevokeUserConfirm(msg);
           break;
         case state.admin.UNREVOKE:
-          verifyAdmin(fromId);
-          logger.info('user: %s, message: choose to unrevoke user "%s"', fromId, message);
-          handleUnRevokeUser(fromId, message);
+          verifyAdmin(userId, chatId);
+          logger.info('user: %s, message: choose to unrevoke user "%s"', userId, message);
+          handleUnRevokeUser(msg);
           break;
         case state.admin.UNREVOKE_CONFIRM:
-          verifyAdmin(fromId);
-          logger.info('user: %s, message: choose the unrevoke confirmation "%s"', fromId, message);
-          handleUnRevokeUserConfirm(fromId, message);
+          verifyAdmin(userId, chatId);
+          logger.info('user: %s, message: choose the unrevoke confirmation "%s"', userId, message);
+          handleUnRevokeUserConfirm(msg);
           break;
         default:
-          return replyWithError(fromId, new Error('Unsure what\'s going on, use the `/clear` command and start over.'));
+          return replyWithError(userId, new Error(i18n.__('unknownState')), chatId);
       }
     }
   }
@@ -209,15 +249,16 @@ bot.on('message', function(msg) {
  * handle full search of movies
  */
 bot.onText(/\/wanted/, function(msg) {
-  var fromId = msg.from.id;
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
 
-  verifyAdmin(fromId);
+  verifyAdmin(userId, chatId);
 
   couchpotato.get('movie.searcher.full_search')
     .then(function(result) {
-      bot.sendMessage(fromId, 'Starting full search for all wanted movies.');
+      sendMessage(chatId, i18n.__('moviesWanted'));
     }).catch(function(err) {
-      replyWithError(fromId, err);
+      replyWithError(userId, err, chatId);
     });
 });
 
@@ -225,60 +266,50 @@ bot.onText(/\/wanted/, function(msg) {
  * handle clear command
  */
 bot.onText(/\/clear/, function(msg) {
-  var fromId = msg.from.id;
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
 
-  verifyUser(fromId);
+  verifyUser(userId, chatId);
 
-  logger.info('user: %s, message: sent \'/clear\' command', fromId);
-  clearCache(fromId);
-  logger.info('user: %s, message: \'/clear\' command successfully executed', fromId);
+  logger.info('user: %s, message: sent \'/clear\' command', userId);
+  clearCache(userId);
+  logger.info('user: %s, message: \'/clear\' command successfully executed', userId);
 
-  bot.sendMessage(fromId, 'All previously sent commands have been cleared, yey!', {
-    'reply_markup': {
-      'hide_keyboard': true
-    }
-  });
+  sendMessage(chatId, i18n.__('clear'));
 });
 
 /*
  * handle authorization
  */
-bot.onText(/\/auth (.+)/, function(msg, match) {
-  var fromId = msg.from.id;
+bot.onText(/\/auth\s(.+)/, function(msg, match) {
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
   var password = match[1];
 
-  var message = [];
-
-  if (isAuthorized(fromId)) {
-    message.push('Already authorized.');
-    message.push('Type /start to begin.');
-    return bot.sendMessage(fromId, message.join('\n'));
+  if (isAuthorized(userId)) {
+    return sendMessage(chatId, i18n.__('alreadyAuthorized'));
   }
 
   // make sure the user is not banned
-  if (isRevoked(fromId)) {
-    message.push('Your access has been revoked and cannot reauthorize.');
-    message.push('Please reach out to the bot owner for support.');
-    return bot.sendMessage(fromId, message.join('\n'));
+  if (isRevoked(userId)) {
+    return sendMessage(chatId, i18n.__('isRevoked'));
   }
 
   if (password !== config.bot.password) {
-    return replyWithError(fromId, new Error('Invalid password.'));
+    return replyWithError(userId, new Error(i18n.__('invalidPassword')), chatId);
   }
 
   acl.allowedUsers.push(msg.from);
   updateACL();
 
   if (acl.allowedUsers.length === 1) {
-    promptOwnerConfig(fromId);
+    promptOwnerConfig(userId);
   }
 
-  message.push('You have been authorized.');
-  message.push('Type /start to begin.');
-  bot.sendMessage(fromId, message.join('\n'));
+  sendMessage(chatId, i18n.__('isAuthorized'));
 
   if (config.bot.owner) {
-    bot.sendMessage(config.bot.owner, getTelegramName(msg.from) + ' has been granted access.');
+    sendMessage(config.bot.owner, getTelegramName(msg.from) + i18n.__('userAuthorized'));
   }
 });
 
@@ -286,55 +317,43 @@ bot.onText(/\/auth (.+)/, function(msg, match) {
  * handle users
  */
 bot.onText(/\/users/, function(msg) {
-  var fromId = msg.from.id;
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
 
-  verifyAdmin(fromId);
+  verifyAdmin(userId, chatId);
 
-  var response = ['*Allowed Users:*'];
-  _.forEach(acl.allowedUsers, function(n, key) {
-    response.push('*' + (key + 1) + '*) ' + getTelegramName(n));
+  var response = ['*' + i18n.__('allowedUsers') + ':*'];
+  _.forEach(acl.allowedUsers, function(user, key) {
+    response.push('*' + (key + 1) + '*) ' + getTelegramName(user));
   });
 
-  bot.sendMessage(fromId, response.join('\n'), {
-    'disable_web_page_preview': true,
-    'parse_mode': 'Markdown',
-    'selective': 2,
-  });
+  sendMessage(chatId, response.join('\n'));
 });
 
 /*
  * handle user access revocation
  */
 bot.onText(/\/revoke/, function(msg) {
-  var fromId = msg.from.id;
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
 
-  verifyAdmin(fromId);
-
-  var opts = {};
+  verifyAdmin(userId, chatId);
 
   if (!acl.allowedUsers.length) {
-    var message = 'There aren\'t any allowed users.';
-
-    opts = {
-      'disable_web_page_preview': true,
-      'parse_mode': 'Markdown',
-      'selective': 2,
-    };
-
-    bot.sendMessage(fromId, message, opts);
+    return sendMessage(chatId, i18n.__('noAllowedUsers'));
   }
 
   var keyboardList = [], keyboardRow = [], revokeList = [];
-  var response = ['*Allowed Users:*'];
-  _.forEach(acl.allowedUsers, function(n, key) {
+  var response = ['*' + i18n.__('allowedUsers') + ':*'];
+  _.forEach(acl.allowedUsers, function(user, key) {
     revokeList.push({
       'id': key + 1,
       'userId': n.id,
-      'keyboardValue': getTelegramName(n)
+      'keyboardValue': getTelegramName(user)
     });
-    response.push('*' + (key + 1) + '*) ' + getTelegramName(n));
+    response.push('*' + (key + 1) + '*) ' + getTelegramName(user));
 
-    keyboardRow.push(getTelegramName(n));
+    keyboardRow.push(getTelegramName(user));
     if (keyboardRow.length === 2) {
       keyboardList.push(keyboardRow);
       keyboardRow = [];
@@ -343,20 +362,16 @@ bot.onText(/\/revoke/, function(msg) {
 
   response.push(i18n.__('selectFromMenu'));
 
-
   if (keyboardRow.length === 1) {
     keyboardList.push([keyboardRow[0]]);
   }
 
   // set cache
-  cache.set('state' + fromId, state.admin.REVOKE);
-  cache.set('revokeUserList' + fromId, revokeList);
+  cache.set('state' + userId, state.admin.REVOKE);
+  cache.set('revokeUserList' + userId, revokeList);
 
-  bot.sendMessage(fromId, response.join('\n'), {
-    'disable_web_page_preview': true,
-    'parse_mode': 'Markdown',
-    'selective': 2,
-    'reply_markup': JSON.stringify({ keyboard: keyboardList, one_time_keyboard: true }),
+  sendMessage(chatId, response.join('\n'), {
+    reply_markup: { keyboard: keyboardList, one_time_keyboard: true },
   });
 });
 
@@ -364,32 +379,25 @@ bot.onText(/\/revoke/, function(msg) {
  * handle user access unrevocation
  */
 bot.onText(/\/unrevoke/, function(msg) {
-  var fromId = msg.from.id;
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
 
-  verifyAdmin(fromId);
-
-  var opts = {};
+  verifyAdmin(userId, chatId);
 
   if (!acl.revokedUsers.length) {
-    var message = 'There aren\'t any revoked users.';
-
-    bot.sendMessage(fromId, message, {
-      'disable_web_page_preview': true,
-      'parse_mode': 'Markdown',
-      'selective': 2,
-    });
+    return sendMessage(chatId, i18n.__('noRevokedUsers'));
   }
 
   var keyboardList = [], keyboardRow = [], revokeList = [];
-  var response = ['*Revoked Users:*'];
-  _.forEach(acl.revokedUsers, function(n, key) {
+  var response = ['*' + i18n.__('revokedUsers') + ':*'];
+  _.forEach(acl.revokedUsers, function(user, key) {
     revokeList.push({
       'id': key + 1,
-      'userId': n.id,
-      'keyboardValue': getTelegramName(n)
+      'userId': user.id,
+      'keyboardValue': getTelegramName(user)
     });
 
-    response.push('*' + (key + 1) + '*) ' + getTelegramName(n));
+    response.push('*' + (key + 1) + '*) ' + getTelegramName(user));
 
     keyboardRow.push(getTelegramName(n));
     if (keyboardRow.length == 2) {
@@ -405,19 +413,17 @@ bot.onText(/\/unrevoke/, function(msg) {
   }
 
   // set cache
-  cache.set('state' + fromId, state.admin.UNREVOKE);
-  cache.set('unrevokeUserList' + fromId, revokeList);
+  cache.set('state' + userId, state.admin.UNREVOKE);
+  cache.set('unrevokeUserList' + userId, revokeList);
 
-  bot.sendMessage(fromId, response.join('\n'), {
-    'disable_web_page_preview': true,
-    'parse_mode': 'Markdown',
-    'selective': 2,
-    'reply_markup': JSON.stringify({ keyboard: keyboardList, one_time_keyboard: true })
+  sendMessage(chatId, response.join('\n'), {
+    reply_markup: { keyboard: keyboardList, one_time_keyboard: true }
   });
 });
 
 bot.onText(/\/library\s?(.+)?/, function(msg, match) {
-  var fromId = msg.from.id;
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
   var query = match[1] || 0;
   /*
   status	array or csv	Filter media by status. Example:"active,done"
@@ -430,7 +436,7 @@ bot.onText(/\/library\s?(.+)?/, function(msg, match) {
 
   couchpotato.get('media.list')
     .then(function(result) {
-      logger.info('user: %s, message: all movies', fromId);
+      logger.info('user: %s, message: all movies', userId);
 
       var response = [];
       _.forEach(result.movies, function(n, key) {
@@ -448,14 +454,14 @@ bot.onText(/\/library\s?(.+)?/, function(msg, match) {
       });
 
       if (!response.length) {
-        return replyWithError(fromId, new Error('Unable to locate ' + query + ' in couchpotato library'));
+        return replyWithError(userId, new Error(i18n.__('queryNoResults') + ': ' + query), chatId);
       }
 
       response.sort();
 
       if (query) {
-        // add title to begining of the array
-        response.unshift('*Found matching results in CouchPotato library:*');
+        // add title to beginning of the array
+        response.unshift('*' + i18n.__('libraryFound') + ':*');
       }
 
       if (response.length > 50) {
@@ -463,30 +469,33 @@ bot.onText(/\/library\s?(.+)?/, function(msg, match) {
         splitReponse.sort();
         _.forEach(splitReponse, function(n) {
           n.sort();
-          bot.sendMessage(fromId, n.join('\n'), { 'parse_mode': 'Markdown', 'selective': 2 });
+          sendMessage(chatId, n.join('\n'));
         });
       } else {
-        bot.sendMessage(fromId, response.join('\n'), { 'parse_mode': 'Markdown', 'selective': 2 });
+        sendMessage(chatId, response.join('\n'));
       }
     })
     .catch(function(err) {
-      replyWithError(fromId, err);
+      replyWithError(userId, err, chatId);
     })
     .finally(function() {
-      clearCache(fromId);
+      clearCache(userId);
     });
 
 });
 
-function handleMovie(userId, movieDisplayName) {
+function handleMovie(msg) {
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
+  var movieDisplayName = msg.text;
   var movieList = cache.get('movieList' + userId);
   if (!movieList) {
-    return replyWithError(userId, new Error('Something went wrong, try searching again'));
+    return replyWithError(userId, new Error(i18n.__('searchAgain')), chatId);
   }
 
   var movie = _.filter(movieList, function(item) { return item.keyboard_value === movieDisplayName; })[0];
   if(!movie){
-    return replyWithError(userId, new Error('Could not find the movie with title "' + movieDisplayName + '"'));
+    return replyWithError(userId, new Error(i18n.__('movieNotFound') + ' "' + movieDisplayName + '".'), chatId);
   }
 
   // create a workflow
@@ -503,11 +512,12 @@ function handleMovie(userId, movieDisplayName) {
         })[0];
 
         if (existingMovie) {
-          throw new Error('Movie already exists and is already being tracked by CouchPotato');
+          cache.set('state' + userId, state.couchpotato.MOVIE_SEARCH);
+          throw new Error(i18n.__('movieExists'));
         }
         workflow.emit('getCouchPotatoProfile');
       }).catch(function(err) {
-        replyWithError(userId, err);
+        replyWithError(userId, err, chatId);
       });
   });
 
@@ -519,11 +529,11 @@ function handleMovie(userId, movieDisplayName) {
     couchpotato.get('profile.list')
       .then(function(result) {
         if (!result.list) {
-          throw new Error('could not get profiles, try searching again');
+          throw new Error(i18n.__('noProfiles'));
         }
 
         if (!cache.get('movieList' + userId)) {
-          throw new Error('could not get previous movie list, try searching again');
+          throw new Error(i18n.__('searchAgain'));
         }
 
         return result.list;
@@ -534,7 +544,7 @@ function handleMovie(userId, movieDisplayName) {
         // only select profiles that are enabled in CP
         var enabledProfiles = _.filter(profiles, function(item) { return (typeof item.hide == 'undefined' || item.hide == false); });
 
-        var response = ['*Found ' + enabledProfiles.length + ' profiles:*\n'];
+        var response = ['*' + i18n.__('foundProfiles') + ': ' + enabledProfiles.length + '*\n'];
         var profileList = [], keyboardList = [], keyboardRow = [];
         _.forEach(enabledProfiles, function(n, key) {
           profileList.push({
@@ -557,7 +567,7 @@ function handleMovie(userId, movieDisplayName) {
         if (keyboardRow.length === 1 && keyboardList.length === 0) {
           keyboardList.push([keyboardRow[0]]);
         }
-        response.push('\n\nPlease select from the menu below.');
+        response.push(i18n.__('selectFromMenu'));
 
 
         // set cache
@@ -570,15 +580,18 @@ function handleMovie(userId, movieDisplayName) {
         };
       })
       .then(function(response) {
-        bot.sendMessage(userId, response.message, {
-          'disable_web_page_preview': true,
-          'parse_mode': 'Markdown',
-          'selective': 2,
-          'reply_markup': JSON.stringify({ keyboard: response.keyboard, one_time_keyboard: true })
+        sendMessage(chatId, response.message, {
+          reply_to_message_id: msg.message_id,
+          reply_markup: {
+            keyboard: response.keyboard,
+            one_time_keyboard: true,
+            force_reply: true,
+            selective: true
+          }
         });
       })
       .catch(function(err) {
-        replyWithError(userId, err);
+        replyWithError(userId, err, chatId);
       });
 
     });
@@ -590,17 +603,20 @@ function handleMovie(userId, movieDisplayName) {
 
 }
 
-function handleProfile(userId, profileName) {
+function handleProfile(msg) {
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
+  var profileName = msg.text;
   var profileList = cache.get('movieProfileList' + userId);
   var movieId = cache.get('movieId' + userId);
   var movieList = cache.get('movieList' + userId);
   if (!profileList || !movieList || !movieId) {
-    return replyWithError(userId, new Error('Something went wrong, try searching again'));
+    return replyWithError(userId, new Error(i18n.__('tryAgain')), chatId);
   }
 
   var profile = _.filter(profileList, function(item) { return item.label === profileName; })[0];
   if(!profile) {
-    return replyWithError(userId, new Error('Could not find the profile "' + profileName + '"'));
+    return replyWithError(userId, new Error(i18n.__('profileNotFound') + ' "' + profileName + '".'), chatId);
   }
 
   var movie = _.filter(movieList, function(item) { return item.id === movieId; })[0];
@@ -614,19 +630,13 @@ function handleProfile(userId, profileName) {
       logger.info('user: %s, message: added movie "%s"', userId, movie.title);
 
       if (!result.success) {
-        throw new Error('could not add movie, try searching again.');
+        throw new Error(i18n.__('movieAddFail'));
       }
 
-      bot.sendMessage(userId, '[Movie added!](' + movie.thumb + ')', {
-        'selective': 2,
-        'parse_mode': 'Markdown',
-        'reply_markup': {
-          'hide_keyboard': true
-        }
-      });
+      sendMessage(chatId, '[' + i18n.__('movieAdded') + '!](' + movie.thumb + ')');
     })
     .catch(function(err) {
-      replyWithError(userId, err);
+      replyWithError(userId, err, chatId);
     })
     .finally(function() {
       clearCache(userId);
@@ -638,7 +648,7 @@ function handleRevokeUser(userId, revokedUser) {
   logger.info('user: %s, message: selected revoke user %s', userId, revokedUser);
 
   var keyboardList = [];
-  var response = ['Are you sure you want to revoke access to ' + revokedUser + '?'];
+  var response = [i18n.__('revokeConfirm') + ' @' + revokedUser + '?'];
   keyboardList.push(['NO']);
   keyboardList.push(['yes']);
 
@@ -646,30 +656,24 @@ function handleRevokeUser(userId, revokedUser) {
   cache.set('state' + userId, state.admin.REVOKE_CONFIRM);
   cache.set('revokedUserName' + userId, revokedUser);
 
-  bot.sendMessage(userId, response.join('\n'), {
-    'disable_web_page_preview': true,
-    'parse_mode': 'Markdown',
-    'selective': 2,
-    'reply_markup': JSON.stringify({ keyboard: keyboardList, one_time_keyboard: true }),
+  sendMessage(userId, response.join('\n'), {
+    reply_markup: { keyboard: keyboardList, one_time_keyboard: true },
   });
 }
 
-function handleRevokeUserConfirm(userId, revokedConfirm) {
-
+function handleRevokeUserConfirm(msg) {
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
+  var revokedConfirm = msg.text;
   logger.info('user: %s, message: selected revoke confirmation %s', userId, revokedConfirm);
 
   var revokedUser = cache.get('revokedUserName' + userId);
-  var opts = {};
   var message = '';
 
   if (revokedConfirm === 'NO' || revokedConfirm === 'no') {
       clearCache(userId);
-      message = 'Access for ' + revokedUser + ' has *NOT* been revoked.';
-      return bot.sendMessage(userId, message, {
-        'disable_web_page_preview': true,
-         'parse_mode': 'Markdown',
-        'selective': 2,
-      });
+      message = i18n.__('accessNotRevoked') + ' @' + revokedUser + '.';
+      return sendMessage(chatId, message);
   }
 
   var revokedUserList = cache.get('revokeUserList' + userId);
@@ -681,23 +685,17 @@ function handleRevokeUserConfirm(userId, revokedConfirm) {
   acl.allowedUsers.splice(j, 1);
   updateACL();
 
-  message = 'Access for ' + revokedUser + ' has been revoked.';
+  message = i18n.__('accessRevoked') + ' @' + revokedUser + '.';
 
-  bot.sendMessage(userId, message, {
-    'disable_web_page_preview': true,
-    'parse_mode': 'Markdown',
-    'selective': 2
-  });
+  sendMessage(chatId, message);
 
   clearCache(userId);
 }
 
-function handleUnRevokeUser(userId, revokedUser) {
-
-  var keyboardList = [];
-  var response = ['Are you sure you want to unrevoke access for ' + revokedUser + '?'];
-  keyboardList.push(['NO']);
-  keyboardList.push(['yes']);
+function handleUnRevokeUser(msg) {
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
+  var revokedUser = msg.text;
 
   // set cache
   cache.set('state' + userId, state.admin.UNREVOKE_CONFIRM);
@@ -705,34 +703,30 @@ function handleUnRevokeUser(userId, revokedUser) {
 
   logger.info('user: %s, message: selected unrevoke user %s', userId, revokedUser);
 
-  var keyboard = {
-    keyboard: keyboardList,
-    one_time_keyboard: true
-  };
-
-  bot.sendMessage(userId, response.join('\n'), {
-    'disable_web_page_preview': true,
-    'parse_mode': 'Markdown',
-    'selective': 2,
-    'reply_markup': JSON.stringify({keyboard: keyboardList, one_time_keyboard: true })
+  var response = i18n.__('unrevokeConfirm') + ' @' + revokedUser + '?';
+  sendMessage(chatId, response, {
+    reply_to_message_id: msg.message_id,
+    reply_markup: {
+      keyboard: [['NO'], ['yes']],
+      one_time_keyboard: true,
+      force_reply: true,
+      selective: true
+    }
   });
 }
 
-function handleUnRevokeUserConfirm(userId, revokedConfirm) {
-
+function handleUnRevokeUserConfirm(msg) {
+  var chatId = msg.chat.id;
+  var userId = msg.from.id;
+  var revokedConfirm = msg.text;
   logger.info('user: %s, message: selected unrevoke confirmation %s', userId, revokedConfirm);
 
   var revokedUser = cache.get('revokedUserName' + userId);
-  var opts = {};
   var message = '';
   if (revokedConfirm === 'NO' || revokedConfirm === 'no') {
       clearCache(userId);
-      message = 'Access for ' + revokedUser + ' has *NOT* been unrevoked.';
-      return bot.sendMessage(userId, message, {
-        'disable_web_page_preview': true,
-        'parse_mode': 'Markdown',
-        'selective': 2,
-      });
+      message = i18n.__('accessNotUnrevoked') + ' @' + revokedUser + '.';
+      return sendMessage(chatId, message);
   }
 
   var unrevokedUserList = cache.get('unrevokeUserList' + userId);
@@ -742,13 +736,9 @@ function handleUnRevokeUserConfirm(userId, revokedConfirm) {
   acl.revokedUsers.splice(j, 1);
   updateACL();
 
-  message = 'Access for ' + revokedUser + ' has been unrevoked.';
+  message = i18n.__('accessUnrevoked') + ' @' + revokedUser + '.';
 
-  bot.sendMessage(userId, message, {
-    'disable_web_page_preview': true,
-    'parse_mode': 'Markdown',
-    'selective': 2,
-  });
+  sendMessage(chatId, message);
 
   clearCache(userId);
 }
@@ -769,30 +759,27 @@ function updateACL() {
 /*
  * verify user can use the bot
  */
-function verifyUser(userId) {
-  if (_.some(acl.allowedUsers, { 'id': userId }) !== true) {
-    return replyWithError(userId, new Error(i18n.__('notAuthorized')));
+function verifyUser(userId, chatId) {
+  if (!isAuthorized(userId)) {
+    return replyWithError(userId, new Error(i18n.__('notAuthorized')), chatId);
   }
 }
 
 /*
  * verify admin of the bot
  */
-function verifyAdmin(userId) {
+function verifyAdmin(userId, chatId) {
   if (isAuthorized(userId)) {
     promptOwnerConfig(userId);
   }
 
   if (config.bot.owner !== userId) {
-    return replyWithError(userId, new Error(i18n.__('adminOnly')));
+    return replyWithError(userId, new Error(i18n.__('adminOnly')), chatId);
   }
 }
 
 function isAdmin(userId) {
-  if (config.bot.owner === userId) {
-    return true;
-  }
-  return false;
+  return config.bot.owner === userId;
 }
 
 /*
@@ -813,26 +800,22 @@ function isRevoked(userId) {
 
 function promptOwnerConfig(userId) {
   if (!config.bot.owner) {
-    var message = ['Your User ID: ' + userId];
-    message.push('Please add your User ID to the config file field labeled \'owner\'.');
-    message.push('Please restart the bot once this has been updated.');
-    bot.sendMessage(userId, message.join('\n'));
+    var message = [i18n.__('yourUserId') + ': ' + userId, i18n.__('ownerConfig')];
+    sendMessage(userId, message.join('\n'));
   }
 }
 
 /*
  * handle removing the custom keyboard
  */
-function replyWithError(userId, err) {
-
+function replyWithError(userId, err, chatId) {
+  chatId = chatId || userId;
+  if (typeof err === 'undefined') {
+    err = new Error(i18n.__('unknownError'))
+  }
   logger.warn('user: %s message: %s', userId, err.message);
 
-  bot.sendMessage(userId, '*Oh no!* ' + err, {
-    'parse_mode': 'Markdown',
-    'reply_markup': {
-      'hide_keyboard': true
-    }
-  });
+  sendMessage(chatId, '*' + i18n.__('ohNo') + '* ' + err);
 }
 
 /*
@@ -853,29 +836,21 @@ function clearCache(userId) {
  * get telegram name
  */
 function getTelegramName(user) {
-   return user.username || (user.first_name + (' ' + user.last_name || ''));
+  return user.username || (user.first_name + (' ' + user.last_name || '')) || user;
 }
 
 /*
- * Send Commands To chat
+ * reply with a message
  */
-function sendCommands(fromId) {
-  var response = ['Hello ' + getTelegramName(fromId) + '!'];
-  response.push('Below is a list of commands you have access to:');
-  response.push('\n*General commands:*');
-  response.push('/start to start this bot');
-  response.push('/help to for this list of commands');
-  response.push('`/q [movie name]` search for a movie');
-  response.push('`/library [movie name]` search CouchPotato library');
-  response.push('/clear clear all previous commands');
-
-  if (isAdmin(fromId)) {
-    response.push('\n*Admin commands:*');
-    response.push('/wanted search all missing/wanted movies');
-    response.push('/users list users');
-    response.push('/revoke revoke user from bot');
-    response.push('/unrevoke un-revoke user from bot');
-  }
-
-  return bot.sendMessage(fromId, response.join('\n'), { 'parse_mode': 'Markdown', 'selective': 2 });
+function sendMessage(chatId, message, opt_opts) {
+  var opts = {
+    disable_notification: true,
+    disable_web_page_preview: true,
+    parse_mode: 'Markdown',
+    reply_markup: {
+      hide_keyboard: true
+    }
+  };
+  if (typeof opt_opts === 'object') { for (var attr in opt_opts) { opts[attr] = opt_opts[attr]; } }
+  bot.sendMessage(chatId, message, opts);
 }
